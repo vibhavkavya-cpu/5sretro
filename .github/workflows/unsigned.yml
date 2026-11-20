@@ -1,9 +1,16 @@
-name: Build unsigned IPA
+name: Build signed IPA
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      export_method:
+        description: Export method
+        type: choice
+        options: [ad-hoc, development, app-store-connect]
+        default: ad-hoc
+
+env:
+  BUNDLE_ID: com.example.retrocam   # must match your provisioning profile
 
 jobs:
   build:
@@ -11,28 +18,69 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen & generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
 
-      - name: Generate Xcode project
-        run: xcodegen generate
+      - name: Import certificate and provisioning profile
+        env:
+          CERT_P12_BASE64: ${{ secrets.CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KC=$RUNNER_TEMP/build.keychain-db
+          echo "$CERT_P12_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          echo "$PROFILE_BASE64" | base64 --decode > $RUNNER_TEMP/profile.mobileprovision
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KC
+          security set-keychain-settings -lut 21600 $KC
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KC
+          security import $RUNNER_TEMP/cert.p12 -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k $KC
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KC
+          security list-keychain -d user -s $KC
+          security cms -D -i $RUNNER_TEMP/profile.mobileprovision > $RUNNER_TEMP/profile.plist
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' $RUNNER_TEMP/profile.plist)
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print Name' $RUNNER_TEMP/profile.plist)
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $RUNNER_TEMP/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
+          echo "PROFILE_NAME=$NAME" >> $GITHUB_ENV
 
-      - name: Build (no code signing)
+      - name: Archive
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
           xcodebuild -project RetroCam.xcodeproj -scheme RetroCam \
-            -configuration Release -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build | xcpretty || exit ${PIPESTATUS[0]}
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/RetroCam.xcarchive archive \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CODE_SIGN_IDENTITY="Apple Distribution" | xcpretty || exit ${PIPESTATUS[0]}
 
-      - name: Package IPA
+      - name: Export IPA
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          METHOD: ${{ inputs.export_method }}
         run: |
-          mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/RetroCam.app Payload/
-          zip -qry RetroCam-unsigned.ipa Payload
+          cat > ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>$METHOD</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key><dict><key>$BUNDLE_ID</key><string>$PROFILE_NAME</string></dict>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/RetroCam.xcarchive \
+            -exportOptionsPlist ExportOptions.plist -exportPath build/ipa
 
       - uses: actions/upload-artifact@v4
         with:
-          name: RetroCam-unsigned-ipa
-          path: RetroCam-unsigned.ipa
+          name: RetroCam-signed-ipa
+          path: build/ipa/*.ipa
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain $RUNNER_TEMP/build.keychain-db || true
